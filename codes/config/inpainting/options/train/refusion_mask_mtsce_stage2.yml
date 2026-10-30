@@ -1,0 +1,172 @@
+#### =====================================================================
+# MTSCE 阶段二：联合微调（基网 + MTSCE 一起训练）
+#
+# 前置：先跑完 stage1，得到 experiments/inpainting/refusion_mask_mtsce_s1/models/ 下的权重。
+# 运行方式（必须在 codes/config/inpainting 目录下执行，数据集路径是相对该目录的）：
+#   cd codes/config/inpainting
+#   python train.py -opt=options/train/refusion_mask_mtsce_stage2.yml
+#
+# 产出：experiments/inpainting/refusion_mask_mtsce/models/
+#         5000_G.pth / 10000_G.pth / ... / latest_G.pth
+#         lastest_EMA.pth   ← 采样/评测优先用它
+#
+# 注意：本文件的 mtsce 配置必须与 stage1 完全一致，否则加载 stage1 权重时形状不匹配会报错
+#       （这是故意的：宁可报错，也不要静默跳过导致结构和权重对不上）。
+# =====================================================================
+name: refusion_mask_mtsce
+use_tb_logger: true
+model: denoising
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+degradation: # for some synthetic dataset that only have GTs
+  # for denoising
+  sigma: 25
+  noise_type: G # Gaussian noise: G
+
+  # for super-resolution
+  scale: 4
+
+#### datasets
+datasets:
+  train:
+    optimizer: Lion # Adam, AdamW, Lion
+    name: Train_Dataset
+    mode: LQGTMask # LQGT + 显式退化掩码（1 = 缺损区，0 = 完整区）
+    dataroot_GT: datasets/dark/train/images
+    dataroot_LQ: datasets/dark/train/masked_images
+    dataroot_mask: datasets/dark/train/masks
+
+    use_shuffle: true
+    n_workers: 4  # per GPU
+    batch_size: 4
+    GT_size: 128
+    LR_size: 128
+    use_flip: true
+    use_rot: true
+    color: RGB
+
+  val:
+    # 同 stage1：训练中用 3 张图快速监控（约 40 秒/次）。全量 val 604 张、T=100，
+    # 一次验证约 2 小时，不适合训练中跑；最终指标与检查点挑选请用
+    # test.py + options/test/refusion_mask_mtsce.yml 在全量 val 上离线评测。
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val_smoke/images
+    dataroot_LQ: datasets/dark/val_smoke/masked_images
+    dataroot_mask: datasets/dark/val_smoke/masks
+    # dataroot_GT: datasets/dark/val/images
+    # dataroot_LQ: datasets/dark/val/masked_images
+    # dataroot_mask: datasets/dark/val/masks
+
+#### network structures
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+
+    # 退化感知潜空间，必须与预训练权重一致
+    use_mask: true
+
+    # =================================================================
+    # MTSCE：多尺度纹理与结构协同增强模块（必须与 stage1 一致）
+    # 详细说明见 MTSCE_IMPLEMENTATION.md §7
+    # =================================================================
+    mtsce:
+      # 总开关。false 时不构建任何子模块，等价基线（消融 D1）
+      enabled: true
+
+      # 插入位置：bottleneck = 方案位置 A；[bottleneck, decoder_4] = 位置 A+B。
+      # 阶段二必须与阶段一相同，否则加载检查点会因形状不匹配报错。
+      insertion_points: [bottleneck]
+
+      # 分支宽度 = round(通道数 × ratio)：0.5 → +9.72M(+12.69%)，0.25 → +2.70M(+3.52%)
+      hidden_ratio: 0.5
+
+      # 分支宽度下限，一般不用改
+      min_hidden: 8
+
+      # 结构分支并行空洞率；纹理细时不要 ≥4，[1] 退化为单尺度
+      structure_dilations: [1, 2, 3]
+
+      # 纹理分支深度可分离卷积核，必须正奇数
+      texture_kernel_size: 3
+
+      # 结构分支开关（D3 消融设 false）
+      use_structure: true
+
+      # 纹理分支开关（D2 消融设 false）
+      use_texture: true
+
+      # 纹理分支是否用 GroupNorm（颜色/亮度被压平可设 false）
+      texture_norm: true
+
+      # 融合方式：adaptive（掩码感知，D5）/ mean（平均，D4）/ add（相加，D4）
+      fusion: adaptive
+
+      # 融合门控是否吃掩码 E(Ms)（false = 无掩码先验对照）
+      use_mask_condition: true
+
+      # 掩码嵌入通道数（二值掩码 8 足够）
+      mask_feat_ch: 8
+
+      # 掩码极性：false = 1 为缺损区（本项目约定）
+      mask_invert: false
+
+      # 可学习残差系数 alpha 初值
+      residual_scale_init: 0.1
+
+#### path
+path:
+  # 阶段一的产出：优先用 EMA 权重；也可换成 20000_G.pth / latest_G.pth
+  pretrain_model_G: C:\Users\rain\Desktop\任务二\refussion-all\re-codex\experiments\inpainting\refusion_mask_mtsce_s1\models\lastest_EMA.pth
+  strict_load: true
+  resume_state: ~
+
+#### training settings: learning rate scheme, loss
+train:
+  optimizer: Lion # Adam, AdamW, Lion
+  lr_G: !!float 4e-5
+  lr_scheme: TrueCosineAnnealingLR
+  beta1: 0.9
+  beta2: 0.99
+  # 与 B 基线（refusion_mask 训练 30000 步得到的 30000_G.pth）对齐，便于公平对比；
+  # 想训更久就改大（原方案里的 700000 步是按大算力写的）
+  niter: 30000
+  warmup_iter: -1  # no warm up
+  lr_steps: [200000, 400000, 600000]
+  lr_gamma: 0.5
+  eta_min: !!float 1e-7
+
+  # ---------------------------------------------------------------------
+  # 阶段二：全部参数一起训练，但用较小学习率
+  # ---------------------------------------------------------------------
+  finetune:
+    # false = 基网与 MTSCE 都训练（699 个张量）
+    freeze_base: false
+    # 与 lr_G 相同即可；想让新模块学得更快可单独调大（会自动分成两个参数组）
+    lr_mtsce: !!float 4e-5
+
+  # criterion（保持原样，才能把 MTSCE 的作用单独隔离出来）
+  is_weighted: False
+  loss_type: l1
+  weight: 1.0
+
+  manual_seed: 0
+  # 每 5000 步在 3 张图上验证一次（约 40 秒）
+  val_freq: !!float 5e3
+
+#### logger
+logger:
+  print_freq: 100
+  # 每次存盘写 2 个文件（G + EMA，各约 345MB），30000 步存 6 次约 4.1GB
+  save_checkpoint_freq: !!float 5e3

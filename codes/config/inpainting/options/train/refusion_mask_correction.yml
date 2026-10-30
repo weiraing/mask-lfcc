@@ -1,0 +1,189 @@
+#### general settings
+# Correction training (module 2): a frozen mask-conditioned Refusion denoiser
+# plus a trainable corrector, see models/modules/correction.py and
+# CORRECTION_IMPLEMENTATION.md.
+#
+# Reference: "Correction Training for Diffusion Models",
+#            https://github.com/sunovivid/correction-training (arXiv 2610.14136)
+#
+#   B (baseline) : options/train/refusion_mask.yml        -> 33.62 dB @ 30k
+#   C (ours)     : this file                              -> B + corrector
+#
+# The denoiser is FROZEN and initialised from B, so at step 0 the corrected
+# prediction is bit-identical to B and the validation PSNR starts at the
+# baseline value. Every gain from here is attributable to the corrector.
+name: refusion_mask_correction
+use_tb_logger: true
+model: correction
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+degradation: # for some synthetic dataset that only have GTs
+  # for denoising
+  sigma: 25
+  noise_type: G # Gaussian noise: G
+
+  # for super-resolution
+  scale: 4
+
+#### datasets
+datasets:
+  train:
+    optimizer: Lion # Adam, AdamW, Lion
+    name: Train_Dataset
+    mode: LQGTMask # LQGT + explicit degradation mask
+    dataroot_GT: datasets/dark/train/images
+    dataroot_LQ: datasets/dark/train/masked_images
+    dataroot_mask: datasets/dark/train/masks
+
+    use_shuffle: true
+    n_workers: 4  # per GPU
+    # must match the baseline run it is compared against: refusion_mask was
+    # trained with batch_size 16 (2138 images -> 134 iters/epoch)
+    batch_size: 16
+    GT_size: 128
+    LR_size: 128
+    use_flip: true
+    use_rot: true
+    color: RGB
+  val:
+    # Monitoring only -- the reported number comes from test.py on the full
+    # 604-image split. The baseline took ~33 min per evaluation at 1x NFE, so
+    # with the corrector it is ~30 min here; see the note under train.val_freq
+    # for how to build a cheap subset.
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val/images
+    dataroot_LQ: datasets/dark/val/masked_images
+    dataroot_mask: datasets/dark/val/masks
+
+#### network structures
+# IDENTICAL to refusion_mask.yml: the corrector is built from this spec, so a
+# mismatch with the checkpoint would fail the strict load.
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+    use_mask: true # Degradation-Aware Latent: concat mask to [x_t - mu, mu]
+
+#### correction training
+correction:
+  enabled: true
+
+  # spaces of the corrector.  IR-SDE is eps-parameterised, so "eps" and "x0"
+  # are the two equivalent prediction spaces; the maps between them are exact
+  # inverses and the SDE update is never touched.
+  input: x0 # what the corrector reads (also fed back as a feature)
+  output: eps # what it writes
+  combine: residual # residual | gated | direct
+
+  # bounded gain on the residual (only used when combine: gated)
+  gate_init: 0.0
+  gate_shape: channel
+  gate_activation: tanh
+
+  # zero-initialised 1x1 projection that injects the denoiser's prediction into
+  # the corrector's first feature map: makes it a *corrector*, not a 2nd denoiser
+  proposal_injection: true
+
+  # reverse steps at which the corrector runs (t = 1 cleanest, t = 100 noisiest).
+  # Full range matches the training distribution. Narrow it to [1, 40] to cut
+  # the extra sampling cost by 60%; the corrector stays valid because it is
+  # trained on the marginal distribution of (x_t, t).
+  apply_t_range: [1, 100]
+
+  # 1 iteration per reverse step during training, 1 at sampling (=> 2x NFE).
+  # steps: 2 recovers more (the reference paper uses 2) at 3x NFE.
+  train_steps: 1
+  steps: 1
+
+  # stop-gradient boundaries, exactly as in the reference implementation
+  detach_input: true
+  detach_skip: true
+
+  # the denoiser is the thing we are trying to improve on: never unfreeze it.
+  # (freeze_base: false enables the joint recipe; it re-opens the failure mode
+  #  that destroyed the previous module, so leave it alone unless you have a
+  #  reason.)
+  freeze_base: true
+
+  optimizer: AdamW
+  lr_correction: !!float 1e-4
+  # the copied backbone only needs a gentle nudge; the zero-initialised head
+  # has to move fast to become non-trivial
+  lr_backbone_scale: !!float 0.2
+  # keep at 0: AdamW weight decay would slowly erode the denoiser weights the
+  # corrector was initialised from
+  weight_decay_correction: !!float 0.0
+  grad_clip: !!float 1.0
+
+  loss_weight: !!float 1.0
+  base_loss_weight: !!float 0.0
+
+#### path
+# All paths are RELATIVE to the run directory (codes/config/inpainting), which is
+# the only assumption this config makes. ``../../../`` always lands on the
+# project root because options.py derives
+#   root = <this file>/../../../
+# from its own location, so moving the whole tree to another machine needs no
+# edit here. Override with an environment variable if the layout differs:
+#   pretrain_model_G: $BASELINE_CKPT      (options.py expands $VAR and ~)
+path:
+  # frozen denoiser = the mask baseline that scored 33.62 dB @ 30k.
+  # It must be copied to the new machine at
+  #   <project root>/experiments/inpainting/refusion_mask/models/30000_G.pth
+  # (non-EMA weights -- the corrector is trained on exactly this file).
+  pretrain_model_G: ../../../experiments/inpainting/refusion_mask/models/30000_G.pth
+  # corrector checkpoint; leave empty to start from the identity. On resume this
+  # is picked up automatically from <iter>_C.pth next to <iter>_G.pth.
+  pretrain_model_C: ~
+  strict_load: true
+  resume_state: ~
+
+#### training settings: learning rate scheme, loss
+train:
+  optimizer: Lion # Adam, AdamW, Lion
+  lr_G: !!float 4e-5
+  lr_scheme: TrueCosineAnnealingLR
+  beta1: 0.9
+  beta2: 0.99
+  niter: 30000
+  warmup_iter: -1  # no warm up
+  lr_steps: [200000, 400000, 600000]
+  lr_gamma: 0.5
+  eta_min: !!float 1e-7
+  weight_decay_G: ~
+
+  # criterion (same objective the denoiser was trained with)
+  is_weighted: False
+  loss_type: l1
+  weight: 1.0
+
+  manual_seed: 0
+  # 604 val images at 1x NFE took ~33 min in the baseline run; with the corrector
+  # attached it is ~2x NFE, so ~30 min per evaluation here -> 6 evaluations of
+  # the 30k run cost ~3 h, i.e. more than the training itself. If that is too
+  # much, either raise this to 1e4 (3 evaluations) or build a 100-image subset:
+  #   mkdir -p datasets/dark/val_smoke/{images,masked_images,masks}
+  #   for f in $(ls datasets/dark/val/images | shuf -n 100); do
+  #     ln -sf $PWD/datasets/dark/val/images/$f datasets/dark/val_smoke/images/
+  #     ln -sf $PWD/datasets/dark/val/masked_images/$f datasets/dark/val_smoke/masked_images/
+  #     ln -sf $PWD/datasets/dark/val/masks/$f datasets/dark/val_smoke/masks/
+  #   done
+  # and point the three dataroots above at val_smoke. Report the final number on
+  # the full 604-image split with test.py either way.
+  val_freq: !!float 5e3
+
+#### logger
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3

@@ -1,0 +1,54 @@
+#### general settings
+# Degradation-Aware Latent (mask-conditioned Refusion) — testing config.
+# Pair with the checkpoint trained by options/train/refusion_mask.yml.
+name: refusion_mask
+suffix: ~  # add suffix to saved images
+model: denoising
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+  # Mask-Guided Data Consistency: OFF here (ablation baseline).
+  # The ON config is options/test/refusion_mask_mgdc.yml.
+  mgdc:
+    enable: false
+
+degradation:
+  # for denoising
+  sigma: 25
+  noise_type: G # Gaussian noise: G
+
+  # for super-resolution
+  scale: 4
+
+datasets:
+  test1:
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val/images
+    dataroot_LQ: datasets/dark/val/masked_images
+    dataroot_mask: datasets/dark/val/masks
+
+#### network structures
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+    use_mask: true # must match the trained model
+
+#### path
+path:
+  # ARM A / B baseline. Must be the SAME file the corrector was trained on top of
+  # (30000_G.pth, i.e. the non-EMA weights that produced the 33.62 dB validation
+  # number). lastest_EMA.pth also exists and is usually slightly better, but it
+  # must then be used for BOTH arms -- never mix them.
+  # Relative to codes/config/inpainting; override with $BASELINE_CKPT if needed.
+  pretrain_model_G: ../../../experiments/inpainting/refusion_mask/models/30000_G.pth

@@ -1,0 +1,79 @@
+#### general settings
+# Correction training — evaluation config (experiment C).
+#
+#   B (baseline) : options/test/refusion_mask.yml   + 30000_G.pth  -> ~33.6 dB
+#   C (ours)     : this file                        + 30000_C.pth  -> B + corrector
+#
+# Both configs point at the same frozen denoiser, so the only difference is the
+# corrector.  Run both with the same --seed for a paired per-image comparison:
+#   python test.py -opt=options/test/refusion_mask.yml            --seed 0
+#   python test.py -opt=options/test/refusion_mask_correction.yml --seed 0
+name: refusion_mask_correction
+suffix: ~  # add suffix to saved images
+model: correction
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+  # Mask-Guided Data Consistency: OFF here (keep the ablation clean)
+  mgdc:
+    enable: false
+
+degradation:
+  # for denoising
+  sigma: 25
+  noise_type: G # Gaussian noise: G
+
+  # for super-resolution
+  scale: 4
+
+datasets:
+  test1:
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val/images
+    dataroot_LQ: datasets/dark/val/masked_images
+    dataroot_mask: datasets/dark/val/masks
+
+#### network structures (must match the trained denoiser)
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+    use_mask: true
+
+#### correction (must match the trained corrector)
+correction:
+  enabled: true
+  input: x0
+  output: eps
+  combine: residual
+  gate_init: 0.0
+  gate_shape: channel
+  gate_activation: tanh
+  proposal_injection: true
+  apply_t_range: [1, 100]
+  train_steps: 1
+  steps: 1
+  detach_input: true
+  detach_skip: true
+  freeze_base: true
+
+#### path
+# relative to codes/config/inpainting (see options.py: root = <this file>/../../../)
+path:
+  # the frozen mask baseline -- identical to options/test/refusion_mask.yml, so
+  # the only difference between the two arms is the corrector
+  pretrain_model_G: ../../../experiments/inpainting/refusion_mask/models/30000_G.pth
+  # the trained corrector. MUST be set: if it is missing the run aborts instead
+  # of silently reproducing the baseline.
+  pretrain_model_C: ../../../experiments/inpainting/refusion_mask_correction/models/30000_C.pth
+  strict_load: true

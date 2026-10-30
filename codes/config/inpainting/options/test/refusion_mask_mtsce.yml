@@ -1,0 +1,122 @@
+#### =====================================================================
+# MTSCE 采样/评测配置（实验 C：掩码通道 ON + MTSCE ON）
+#
+# 运行方式（必须在 codes/config/inpainting 目录下执行）：
+#   cd codes/config/inpainting
+#   python test.py -opt=options/test/refusion_mask_mtsce.yml --seed 0
+#
+# ⚠️ 一定要带 --seed：反向 SDE 每步都注入高斯噪声，同一配置两次跑 PSNR 可差 0.3~0.7 dB。
+#    与基线做 A/B 时两边用同一个 --seed（脚本会按图像重新设种，与网络构建消耗的随机数无关）：
+#      python test.py -opt=options/test/refusion_mask.yml       --seed 0   # B 基线
+#      python test.py -opt=options/test/refusion_mask_mtsce.yml --seed 0   # C 本方法
+#
+# 产出：results/inpainting/refusion_mask_mtsce/Val_Dataset/*.png + 同目录日志里的
+#       PSNR / SSIM / LPIPS / PSNR_Y / SSIM_Y
+#
+# 注意：本文件的 mtsce 配置必须与训练时完全一致（插入点、hidden_ratio、各开关），
+#       否则加载检查点会因形状不匹配报错——这是刻意设计，避免“训练开、推理关”的静默错误。
+# =====================================================================
+name: refusion_mask_mtsce
+suffix: ~  # add suffix to saved images
+model: denoising
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+  # Mask-Guided Data Consistency 保持关闭：本实验要隔离 MTSCE 的作用
+  mgdc:
+    enable: false
+
+degradation:
+  # for denoising
+  sigma: 25
+  noise_type: G # Gaussian noise: G
+
+  # for super-resolution
+  scale: 4
+
+datasets:
+  test1:
+    # 全量验证集 604 张 256x256，T=100 采样约 12s/张，一次评测约 2 小时。
+    # 只想快速看结果时，把下面三行换成注释里的 val_smoke（3 张，约 40 秒）。
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val/images
+    dataroot_LQ: datasets/dark/val/masked_images
+    dataroot_mask: datasets/dark/val/masks
+    # dataroot_GT: datasets/dark/val_smoke/images
+    # dataroot_LQ: datasets/dark/val_smoke/masked_images
+    # dataroot_mask: datasets/dark/val_smoke/masks
+
+#### network structures
+# 必须与训练配置（stage1 + stage2）完全一致
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+
+    # 退化感知潜空间，与训练权重一致
+    use_mask: true
+
+    # =================================================================
+    # MTSCE：多尺度纹理与结构协同增强模块（逐项说明见 MTSCE_IMPLEMENTATION.md §7）
+    # =================================================================
+    mtsce:
+      # 总开关。采样时设 false 就是“用 C 的权重跑 B 的结构”，只用于排查问题，
+      # 正式对比请用各自训练好的权重（B 用 refusion_mask.yml，C 用本文件）。
+      enabled: true
+
+      # 插入位置：bottleneck = 方案位置 A；[bottleneck, decoder_4] = 位置 A+B
+      insertion_points: [bottleneck]
+
+      # 分支宽度 = round(通道数 × ratio)：0.5 → +9.72M(+12.69%)，0.25 → +2.70M(+3.52%)
+      hidden_ratio: 0.5
+
+      # 分支宽度下限，一般不用改
+      min_hidden: 8
+
+      # 结构分支并行空洞率；纹理细时不要 ≥4，[1] 退化为单尺度
+      structure_dilations: [1, 2, 3]
+
+      # 纹理分支深度可分离卷积核，必须正奇数
+      texture_kernel_size: 3
+
+      # 结构分支开关（D3 消融设 false）
+      use_structure: true
+
+      # 纹理分支开关（D2 消融设 false）
+      use_texture: true
+
+      # 纹理分支是否用 GroupNorm
+      texture_norm: true
+
+      # 融合方式：adaptive（掩码感知，D5）/ mean（平均，D4）/ add（相加，D4）
+      fusion: adaptive
+
+      # 融合门控是否吃掩码 E(Ms)（false = 无掩码先验对照）
+      use_mask_condition: true
+
+      # 掩码嵌入通道数（二值掩码 8 足够）
+      mask_feat_ch: 8
+
+      # 掩码极性：false = 1 为缺损区（本项目约定）
+      mask_invert: false
+
+      # 可学习残差系数 alpha 初值（加载检查点后会被训练值覆盖）
+      residual_scale_init: 0.1
+
+#### path
+path:
+  # 阶段二（联合微调）的产出。先用 EMA 权重，也可以换成某个 5000_G.pth 做检查点挑选。
+  # 只想跑 smoke 回归时可换成 our_model_30000 里没有 MTSCE 的旧权重：
+  #   此时 MTSCE 保持零初始化，结果应与 B 基线逐比特一致（见 verify_mtsce_infer.py）
+  pretrain_model_G: C:\Users\rain\Desktop\任务二\refussion-all\re-codex\experiments\inpainting\refusion_mask_mtsce\models\lastest_EMA.pth
+  strict_load: true

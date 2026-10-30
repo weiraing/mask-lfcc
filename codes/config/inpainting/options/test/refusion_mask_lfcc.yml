@@ -1,0 +1,92 @@
+#### general settings
+# Boundary-consistent low-frequency correction — learned gate (experiment C).
+#
+#   B (baseline) : options/test/refusion_mask.yml       + 30000_G.pth
+#   C (ours)     : this file                            + <iter>_C.pth
+#
+# Both point at the same frozen denoiser, so the only difference is the gate.
+# Use the same --seed for a paired per-image comparison:
+#   python test.py -opt=options/test/refusion_mask.yml      --seed 0
+#   python test.py -opt=options/test/refusion_mask_lfcc.yml --seed 0
+name: refusion_mask_lfcc
+suffix: ~  # add suffix to saved images
+model: correction
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+  # Mask-Guided Data Consistency: OFF here (keep the ablation clean)
+  mgdc:
+    enable: false
+
+degradation:
+  # for denoising
+  sigma: 25
+  noise_type: G # Gaussian noise: G
+
+  # for super-resolution
+  scale: 4
+
+datasets:
+  test1:
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val/images
+    dataroot_LQ: datasets/dark/val/masked_images
+    dataroot_mask: datasets/dark/val/masks
+
+#### network structures (must match the trained denoiser)
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+    use_mask: true
+
+#### correction (must match the trained gate)
+correction:
+  enabled: true
+  arch: lowfreq
+  input: x0
+  output: x0
+  combine: residual
+  lowfreq_alpha_init: 0.0
+  lowfreq_alpha_range: 0.5
+  # final composite strength; 0.2 is the measured optimum on the
+  # 604-image dark val (+0.40 dB inside the hole, per-image oracle
+  # +0.76 dB). It starts there, so training can only improve on it.
+  lowfreq_alpha_final_init: 0.2
+  # must match the training value; with 0.05 the modulation only moves the
+  # effective alpha inside [0.15, 0.25], around the measured optimum
+  lowfreq_final_mod_range: 0.05
+  lowfreq_cells: 64
+  lowfreq_iters: 160
+  lowfreq_coarse_iters: 200
+  lowfreq_hidden: 48
+  lowfreq_blocks: 4
+  trainable: true
+  apply_t_range: [1, 100]
+  train_t_range: [1, 100]
+  train_steps: 1
+  steps: 1
+  detach_input: true
+  detach_skip: true
+  freeze_base: true
+
+#### path
+# relative to codes/config/inpainting (see options.py: root = <this file>/../../../)
+path:
+  # the frozen mask baseline -- identical to options/test/refusion_mask.yml, so
+  # the only difference between the two arms is the corrector
+  pretrain_model_G: /root/re-codex/experiments/inpainting/refusion_mask_dark/models/30000_G.pth
+  # the trained corrector. MUST be set: if it is missing the run aborts instead
+  # of silently reproducing the baseline.
+  pretrain_model_C: /root/tt/experiments/inpainting/refusion_mask_lfcc/models/6000_C.pth
+  strict_load: true

@@ -1,0 +1,44 @@
+#### general settings
+# smoke test baseline (MGDC off)
+name: smoke_base
+suffix: ~  # add suffix to saved images
+model: denoising
+distortion: derain
+gpu_ids: [0]
+
+sde:
+  max_sigma: 50
+  T: 100
+  schedule: cosine # linear, cosine
+  eps: 0.005
+
+  mgdc:
+    enable: false
+
+degradation:
+  sigma: 25
+  noise_type: G
+  scale: 4
+
+datasets:
+  test1:
+    name: Val_Dataset
+    mode: LQGTMask
+    dataroot_GT: datasets/dark/val_smoke/images
+    dataroot_LQ: datasets/dark/val_smoke/masked_images
+    dataroot_mask: datasets/dark/val_smoke/masks
+
+#### network structures
+network_G:
+  which_model_G: ConditionalNAFNet
+  setting:
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+    use_mask: true
+
+#### path
+path:
+  pretrain_model_G: C:\Users\rain\Desktop\任务二\our_model_30000\our_model_30000\refusion_mask_dark\models\lastest_EMA.pth
+  strict_load: true
